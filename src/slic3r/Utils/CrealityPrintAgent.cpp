@@ -184,11 +184,12 @@ bool CrealityPrintAgent::parse_cfs_response(const std::string&    response,
     // Sequential AMS-style index for accepted CFS boxes. The K2's raw box.id has
     // gaps (id 0 is the external spool holder, type=1, skipped) — using the raw id
     // would publish phantom slots for the gap. Renumber accepted boxes 0,1,2,...
+    // Note: we intentionally do NOT filter on box.state. K2 uses state=1 for active
+    // CFS boxes, but K1 SE omits the field or reports state=0 even for a connected
+    // box. Filtering on box.state would silently drop all K1 SE CFS slots.
     int cfs_count = 0;
     for (const auto& box : resp["boxsInfo"]["materialBoxs"]) {
-        const int box_st   = box.value("state", 0);
         const int box_type = box.value("type",  0);
-        if (box_st != 1)   continue; // inactive boxes
         if (box_type != 0) continue; // non-CFS (external spool holder, handled separately by upload dialog)
 
         const int cfs_index = cfs_count++;
