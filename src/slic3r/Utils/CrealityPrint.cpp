@@ -216,28 +216,38 @@ static void ws_connect(net::io_context& ioc, websocket::stream<beast::tcp_stream
         }));
     ws.handshake(host, "/");
 
-#ifdef _WIN32
-    DWORD recv_timeout = 3000;
-#else
-    struct timeval recv_timeout = {3, 0};
-#endif
-    setsockopt(beast::get_lowest_layer(ws).socket().native_handle(),
-               SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&recv_timeout), sizeof(recv_timeout));
+    // K1-family firmware requires WebSocket TEXT frames; K2-family accepts both.
+    ws.text(true);
+
+    // Leave expires_after management to the caller (per-phase). Do NOT use
+    // SO_RCVTIMEO here: on macOS/Linux Boost.Asio uses kqueue/epoll internally,
+    // so socket-level SO_RCVTIMEO has no effect on Boost.Asio operations.
 }
 
 static std::string ws_send_and_read(websocket::stream<beast::tcp_stream>& ws, const json& cmd, const std::string& expected_key, int max_reads = 20)
 {
     ws.write(net::buffer(to_string(cmd)));
 
-    for (int i = 0; i < max_reads; i++) {
+    // total_reads caps the loop if the printer sends a continuous stream of heartbeats
+    for (int reads = 0, total = 0; reads < max_reads && total < max_reads * 3; ++total) {
         beast::flat_buffer buf;
         beast::error_code ec;
         ws.read(buf, ec);
-        if (ec == net::error::would_block)
+        // would_block = SO_RCVTIMEO fired (Windows/raw sockets)
+        // beast::error::timeout = expires_after() fired (Boost.Beast timer, macOS/Linux)
+        if (ec == net::error::would_block || ec == beast::error::timeout)
             break;
         if (ec)
             throw beast::system_error{ec};
         std::string msg = beast::buffers_to_string(buf.data());
+        // K1-family firmware sends periodic heartbeat pings while we wait for data.
+        // Ack them immediately so the printer does not close the connection.
+        if (msg.find("heart_beat") != std::string::npos) {
+            beast::error_code wr_ec;
+            ws.write(net::buffer(std::string("ok")), wr_ec);
+            continue; // don't count toward reads limit
+        }
+        ++reads;
         if (msg.find(expected_key) != std::string::npos)
             return msg;
     }
@@ -281,14 +291,81 @@ std::string CrealityPrint::model_name() const
 
 std::string CrealityPrint::query_boxes_info() const
 {
+    BOOST_LOG_TRIVIAL(info) << "CrealityPrint::query_boxes_info: connecting to " << m_host << " port 9999";
     try {
         net::io_context ioc;
         websocket::stream<beast::tcp_stream> ws{ioc};
         ws_connect(ioc, ws, m_host, "9999");
+        BOOST_LOG_TRIVIAL(info) << "CrealityPrint::query_boxes_info: WS handshake complete";
 
+        // Step 1: Drain one initial status frame that K1-family firmware pushes right
+        // after the handshake. The printer ignores commands until this exchange completes.
+        // K1 SE sends frames every ~4 s; we wait for exactly one (8 s timeout).
+        // Note: SO_RCVTIMEO has no effect with Boost.Asio on macOS/Linux (kqueue/epoll);
+        // expires_after() on tcp_stream is used instead, but it only fires before the
+        // NEXT operation — it cannot interrupt an in-progress ws.read().
+        beast::get_lowest_layer(ws).expires_after(std::chrono::seconds(8));
+        {
+            beast::flat_buffer buf; beast::error_code ec;
+            ws.read(buf, ec);
+            if (!ec) {
+                std::string frame = beast::buffers_to_string(buf.data());
+                BOOST_LOG_TRIVIAL(debug) << "CrealityPrint::query_boxes_info: burst frame: "
+                    << frame.substr(0, 120);
+                if (frame.find("heart_beat") != std::string::npos) {
+                    beast::error_code we; ws.write(net::buffer(std::string("ok")), we);
+                }
+            } else {
+                BOOST_LOG_TRIVIAL(debug) << "CrealityPrint::query_boxes_info: burst done ("
+                    << ec.message() << ")";
+            }
+        }
+
+        // Step 2: Client-initiated heartbeat handshake — 5 s for the exchange.
+        beast::get_lowest_layer(ws).expires_after(std::chrono::seconds(5));
+        BOOST_LOG_TRIVIAL(info) << "CrealityPrint::query_boxes_info: sending heartbeat";
+        ws.write(net::buffer(to_string(json{{"ModeCode", "heart_beat"}})));
+        BOOST_LOG_TRIVIAL(info) << "CrealityPrint::query_boxes_info: heartbeat write OK, waiting for ok";
+
+        bool got_hb_ok = false;
+        for (int i = 0; i < 10; i++) {
+            beast::flat_buffer buf; beast::error_code ec;
+            ws.read(buf, ec);
+            if (ec) {
+                BOOST_LOG_TRIVIAL(warning) << "CrealityPrint::query_boxes_info: heartbeat read[" << i
+                    << "] error: " << ec.message();
+                break;
+            }
+            std::string reply = beast::buffers_to_string(buf.data());
+            BOOST_LOG_TRIVIAL(debug) << "CrealityPrint::query_boxes_info: heartbeat reply[" << i
+                << "]: " << reply;
+            std::string trimmed = reply;
+            trimmed.erase(0, trimmed.find_first_not_of(" \t\r\n"));
+            if (!trimmed.empty()) trimmed.erase(trimmed.find_last_not_of(" \t\r\n") + 1);
+            if (trimmed == "ok") { got_hb_ok = true; break; }
+            if (reply.find("heart_beat") != std::string::npos) {
+                beast::error_code we; ws.write(net::buffer(std::string("ok")), we);
+            }
+        }
+        BOOST_LOG_TRIVIAL(info) << "CrealityPrint::query_boxes_info: heartbeat phase done"
+            << (got_hb_ok ? " (got ok)" : " (no ok)");
+
+        // Step 3: Request box info — 10 s for request + response.
+        beast::get_lowest_layer(ws).expires_after(std::chrono::seconds(10));
+        BOOST_LOG_TRIVIAL(info) << "CrealityPrint::query_boxes_info: sending boxsInfo request";
         json boxs_query = {{"method", "get"}, {"params", {{"boxsInfo", 1}}}};
         std::string result = ws_send_and_read(ws, boxs_query, "boxsInfo");
-        ws.close(websocket::close_code::normal);
+        BOOST_LOG_TRIVIAL(info) << "CrealityPrint::query_boxes_info: boxsInfo result size=" << result.size();
+
+        // Close gracefully; the K1 SE closes its side after sending the response, so
+        // ws.close() will get EOF — use the error_code overload to avoid throwing and
+        // discarding the already-received result.
+        beast::error_code close_ec;
+        beast::get_lowest_layer(ws).expires_after(std::chrono::seconds(3));
+        ws.close(websocket::close_code::normal, close_ec);
+        if (close_ec)
+            BOOST_LOG_TRIVIAL(debug) << "CrealityPrint::query_boxes_info: close: " << close_ec.message();
+
         return result;
     } catch (std::exception const& e) {
         BOOST_LOG_TRIVIAL(error) << "CrealityPrint: Failed to query boxsInfo: " << e.what();
@@ -329,12 +406,43 @@ std::string CrealityPrint::get_print_host_webui(DynamicPrintConfig* config)
 bool CrealityPrint::start_print(wxString &msg, const std::string &filename, const std::map<std::string, std::string>& extended_info) const
 {
     try {
-        const std::string gcode_path = "/mnt/UDISK/printer_data/gcodes/" + filename;
+        // K1-family firmware (K1 SE) stores gcodes under /usr/data; K2-family uses /mnt/UDISK.
+        const std::string data_root = (m_model == "K1 SE") ? "/usr/data" : "/mnt/UDISK";
+        const std::string gcode_path = data_root + "/printer_data/gcodes/" + filename;
 
         net::io_context ioc;
         websocket::stream<beast::tcp_stream> ws{ioc};
         ws_connect(ioc, ws, m_host, "9999");
 
+        // K1-family requires reading one initial status frame then a heartbeat
+        // handshake before it accepts print commands — same as query_boxes_info().
+        beast::get_lowest_layer(ws).expires_after(std::chrono::seconds(8));
+        {
+            beast::flat_buffer buf; beast::error_code ec;
+            ws.read(buf, ec);
+            if (!ec) {
+                std::string frame = beast::buffers_to_string(buf.data());
+                if (frame.find("heart_beat") != std::string::npos) {
+                    beast::error_code we; ws.write(net::buffer(std::string("ok")), we);
+                }
+            }
+        }
+        beast::get_lowest_layer(ws).expires_after(std::chrono::seconds(5));
+        ws.write(net::buffer(to_string(json{{"ModeCode", "heart_beat"}})));
+        for (int i = 0; i < 10; i++) {
+            beast::flat_buffer buf; beast::error_code ec;
+            ws.read(buf, ec);
+            if (ec) break;
+            std::string reply = beast::buffers_to_string(buf.data());
+            reply.erase(0, reply.find_first_not_of(" \t\r\n"));
+            if (!reply.empty()) reply.erase(reply.find_last_not_of(" \t\r\n") + 1);
+            if (reply == "ok") break;
+            if (reply.find("heart_beat") != std::string::npos) {
+                beast::error_code we; ws.write(net::buffer(std::string("ok")), we);
+            }
+        }
+
+        beast::get_lowest_layer(ws).expires_after(std::chrono::seconds(10));
         if (supports_multi_color_print()) {
             // Build colorMatch list from the mapping provided by the dialog
             bool use_spool_holder = false;
@@ -416,7 +524,9 @@ bool CrealityPrint::start_print(wxString &msg, const std::string &filename, cons
             ws.read(buffer);
         }
 
-        ws.close(websocket::close_code::normal);
+        beast::error_code close_ec;
+        beast::get_lowest_layer(ws).expires_after(std::chrono::seconds(3));
+        ws.close(websocket::close_code::normal, close_ec);
         return true;
     } catch(std::exception const& e) {
         BOOST_LOG_TRIVIAL(error) << "CrealityPrint: Error starting print: " << e.what();
